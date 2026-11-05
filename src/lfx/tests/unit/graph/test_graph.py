@@ -1,12 +1,19 @@
 import copy
 import json
 import pickle
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from lfx.graph import Graph
 from lfx.graph.graph.utils import (
+    GROUP_PROXY_DUPLICATE_CHILD_ID,
+    GROUP_PROXY_MALFORMED,
+    GROUP_PROXY_MISSING_CHILD_FIELD,
+    GROUP_PROXY_MISSING_CHILD_NODE,
+    GroupProxyReferenceIssue,
+    check_group_proxy_references,
     find_last_node,
     process_flow,
     set_new_target_handle,
@@ -482,6 +489,216 @@ def test_update_template(sample_template, sample_nodes):
 
     # Ensure node3 remains unchanged
     assert node3_updated == sample_nodes[2]
+
+
+# --- check_group_proxy_references ---------------------------------------
+
+SENTINEL_FIELD_VALUE = "FIELD-VALUE-MUST-NOT-LEAK"
+_PROXY_UNSET = object()
+
+
+def _proxy_test_field(proxy=_PROXY_UNSET):
+    field = {"show": True, "advanced": False, "value": SENTINEL_FIELD_VALUE}
+    if proxy is not _PROXY_UNSET:
+        field["proxy"] = proxy
+    return field
+
+
+def _proxy_test_child(node_id, *field_names):
+    return {
+        "id": node_id,
+        "data": {"node": {"template": {name: {"show": True} for name in field_names}}},
+    }
+
+
+def _proxy_test_group(group_id, template, child_nodes):
+    return {
+        "id": group_id,
+        "data": {
+            "id": group_id,
+            "type": "GroupNode",
+            "node": {
+                "template": template,
+                "flow": {"data": {"nodes": child_nodes, "edges": []}},
+            },
+        },
+    }
+
+
+def _proxy_issue_tuples(issues):
+    return [(issue.field_name, issue.category, issue.proxy_id, issue.proxy_field) for issue in issues]
+
+
+def test_check_group_proxy_references_accepts_valid_proxies_and_plain_fields():
+    child = _proxy_test_child("Child-1", "input_value")
+    group = _proxy_test_group(
+        "Group-1",
+        {
+            "exposed_input": _proxy_test_field({"id": "Child-1", "field": "input_value"}),
+            "plain_input": _proxy_test_field(),
+        },
+        [child],
+    )
+    flow_data = {"nodes": [group], "edges": []}
+    snapshot = copy.deepcopy(flow_data)
+
+    assert check_group_proxy_references(flow_data) == []
+    # The check reads the grouped shape only: no expansion, no mutation.
+    assert flow_data == snapshot
+
+
+def test_check_group_proxy_references_reports_multiple_broken_references():
+    child = _proxy_test_child("Child-1", "input_value")
+    group = _proxy_test_group(
+        "Group-1",
+        {
+            "valid_input": _proxy_test_field({"id": "Child-1", "field": "input_value"}),
+            "missing_node_input": _proxy_test_field({"id": "Ghost-Node", "field": "input_value"}),
+            "missing_field_input": _proxy_test_field({"id": "Child-1", "field": "gone_field"}),
+            "malformed_input": _proxy_test_field({"id": "Child-1"}),
+            "empty_proxy_input": _proxy_test_field({}),
+        },
+        [child],
+    )
+    flow_data = {"nodes": [group], "edges": []}
+    snapshot = copy.deepcopy(flow_data)
+
+    issues = check_group_proxy_references(flow_data)
+
+    assert _proxy_issue_tuples(issues) == [
+        ("missing_node_input", GROUP_PROXY_MISSING_CHILD_NODE, "Ghost-Node", "input_value"),
+        ("missing_field_input", GROUP_PROXY_MISSING_CHILD_FIELD, "Child-1", "gone_field"),
+        ("malformed_input", GROUP_PROXY_MALFORMED, "Child-1", None),
+        ("empty_proxy_input", GROUP_PROXY_MALFORMED, None, None),
+    ]
+    assert {issue.group_id for issue in issues} == {"Group-1"}
+    assert all(isinstance(issue, GroupProxyReferenceIssue) for issue in issues)
+    # Findings carry coordinates only — never field values.
+    for issue in issues:
+        assert asdict(issue).keys() == {
+            "group_id",
+            "field_name",
+            "category",
+            "proxy_id",
+            "proxy_field",
+        }
+        assert SENTINEL_FIELD_VALUE not in repr(issue)
+    assert flow_data == snapshot
+
+
+def test_check_group_proxy_references_reports_duplicate_child_ids_once():
+    first_dup = _proxy_test_child("Dup-Child", "shared_field")
+    second_dup = _proxy_test_child("Dup-Child", "other_field")
+    other = _proxy_test_child("Other-Child", "plain")
+    group = _proxy_test_group(
+        "Group-1",
+        {
+            # Resolves against the first occurrence, mirroring update_template.
+            "dup_input": _proxy_test_field({"id": "Dup-Child", "field": "shared_field"}),
+            "other_input": _proxy_test_field({"id": "Other-Child", "field": "plain"}),
+        },
+        [first_dup, second_dup, other],
+    )
+
+    issues = check_group_proxy_references({"nodes": [group], "edges": []})
+
+    assert _proxy_issue_tuples(issues) == [
+        (None, GROUP_PROXY_DUPLICATE_CHILD_ID, "Dup-Child", None),
+    ]
+
+
+def test_check_group_proxy_references_duplicate_id_uses_first_occurrence_for_fields():
+    # The field exists only on the second duplicate; the first-wins resolution
+    # used by update_template must therefore report it as missing.
+    group = _proxy_test_group(
+        "Group-1",
+        {
+            "dup_input": _proxy_test_field({"id": "Dup-Child", "field": "only_on_second"}),
+        },
+        [
+            _proxy_test_child("Dup-Child", "first_field"),
+            _proxy_test_child("Dup-Child", "only_on_second"),
+        ],
+    )
+
+    issues = check_group_proxy_references({"nodes": [group], "edges": []})
+
+    assert _proxy_issue_tuples(issues) == [
+        (None, GROUP_PROXY_DUPLICATE_CHILD_ID, "Dup-Child", None),
+        ("dup_input", GROUP_PROXY_MISSING_CHILD_FIELD, "Dup-Child", "only_on_second"),
+    ]
+
+
+def test_check_group_proxy_references_ignores_groups_without_proxy_fields():
+    group = _proxy_test_group(
+        "Group-1",
+        {
+            "plain_input": _proxy_test_field(),
+            "null_proxy_input": _proxy_test_field(None),
+            "code": {"type": "code", "value": SENTINEL_FIELD_VALUE},
+        },
+        [_proxy_test_child("Child-1", "anything")],
+    )
+
+    assert check_group_proxy_references({"nodes": [group], "edges": []}) == []
+    # Non-group flows and malformed payloads yield nothing as well.
+    assert check_group_proxy_references({"nodes": [_proxy_test_child("Solo-1")], "edges": []}) == []
+    assert check_group_proxy_references({}) == []
+    assert check_group_proxy_references(None) == []
+
+
+def test_check_group_proxy_references_checks_nested_groups_layer_by_layer():
+    inner_child = _proxy_test_child("Inner-Child", "keep_field")
+    inner_group = _proxy_test_group(
+        "Inner-Group",
+        {
+            "inner_ok": _proxy_test_field({"id": "Inner-Child", "field": "keep_field"}),
+            "inner_missing_node": _proxy_test_field({"id": "Ghost-Inner", "field": "x"}),
+            "inner_missing_field": _proxy_test_field({"id": "Inner-Child", "field": "x"}),
+        },
+        [inner_child],
+    )
+    outer_group = _proxy_test_group(
+        "Outer-Group",
+        {
+            "outer_ok": _proxy_test_field({"id": "Outer-Child", "field": "outer_field"}),
+            # Grandchildren are not direct children of the outer group.
+            "skips_grandchild": _proxy_test_field({"id": "Inner-Child", "field": "keep_field"}),
+        },
+        [_proxy_test_child("Outer-Child", "outer_field"), inner_group],
+    )
+    snapshot = copy.deepcopy(outer_group)
+
+    issues = check_group_proxy_references({"nodes": [outer_group], "edges": []})
+
+    by_group = {}
+    for issue in issues:
+        by_group.setdefault(issue.group_id, []).append(
+            (issue.field_name, issue.category, issue.proxy_id, issue.proxy_field)
+        )
+
+    assert by_group == {
+        "Outer-Group": [
+            ("skips_grandchild", GROUP_PROXY_MISSING_CHILD_NODE, "Inner-Child", "keep_field"),
+        ],
+        "Inner-Group": [
+            ("inner_missing_node", GROUP_PROXY_MISSING_CHILD_NODE, "Ghost-Inner", "x"),
+            ("inner_missing_field", GROUP_PROXY_MISSING_CHILD_FIELD, "Inner-Child", "x"),
+        ],
+    }
+    # Nested flow data is inspected in place and must stay untouched.
+    assert outer_group == snapshot
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    ["grouped_chat_json_flow", "one_grouped_chat_json_flow", "vector_store_grouped_json_flow"],
+)
+def test_check_group_proxy_references_clean_on_shipped_grouped_flows(request, fixture_name):
+    # vector_store_grouped contains a group nested inside another group.
+    flow_data = json.loads(request.getfixturevalue(fixture_name)).get("data")
+
+    assert check_group_proxy_references(flow_data) == []
 
 
 # Test `update_target_handle`

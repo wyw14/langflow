@@ -1,6 +1,7 @@
 import copy
 from collections import defaultdict, deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import networkx as nx
@@ -9,6 +10,33 @@ from lfx.log.logger import logger
 
 PRIORITY_LIST_OF_INPUTS = ["webhook", "chat"]
 MAX_CYCLE_APPEARANCES = 2
+
+# Group proxy reference issue categories.
+GROUP_PROXY_MALFORMED = "malformed_proxy"
+GROUP_PROXY_MISSING_CHILD_NODE = "missing_child_node"
+GROUP_PROXY_MISSING_CHILD_FIELD = "missing_child_field"
+GROUP_PROXY_DUPLICATE_CHILD_ID = "duplicate_child_id"
+
+
+@dataclass(frozen=True)
+class GroupProxyReferenceIssue:
+    """One broken proxy reference in a group node's input template.
+
+    Carries only coordinates — never field values:
+
+    - ``group_id``: id of the group node whose template declares the proxy.
+    - ``field_name``: location of the proxy, i.e. the template field key on the
+      group node. ``None`` for group-level issues without a proxy field.
+    - ``category``: one of the ``GROUP_PROXY_*`` constants.
+    - ``proxy_id`` / ``proxy_field``: the referenced child coordinates, when
+      available on the (possibly malformed) proxy.
+    """
+
+    group_id: str | None
+    field_name: str | None
+    category: str
+    proxy_id: str | None = None
+    proxy_field: str | None = None
 
 
 def find_start_component_id(vertices, *, is_webhook: bool = False):
@@ -140,6 +168,135 @@ def update_template(template, g_nodes) -> None:
             child_template[field]["show"] = show
             child_template[field]["advanced"] = advanced
             child_template[field]["display_name"] = display_name
+
+
+def check_group_proxy_references(flow_object: dict) -> list[GroupProxyReferenceIssue]:
+    """Check that every group-node input proxy points at an existing child field.
+
+    The check walks the nested, still-grouped frontend shape (each group node's
+    ``data.node.flow.data.nodes``) layer by layer and verifies, for every input
+    template field carrying a ``proxy``, that ``proxy.id`` is one of the
+    group's direct child nodes and ``proxy.field`` is a key of that child's
+    template.
+
+    The flow is neither expanded nor modified (``process_flow``/``ungroup_node``
+    are not called), no component is instantiated, and findings never contain
+    field values — only coordinates (group id, proxy field location, referenced
+    child id/field).
+
+    Issue categories:
+
+    - :data:`GROUP_PROXY_MALFORMED`: ``proxy`` is not a dict with string ``id``
+      and ``field`` entries.
+    - :data:`GROUP_PROXY_MISSING_CHILD_NODE`: ``proxy.id`` matches no direct
+      child node.
+    - :data:`GROUP_PROXY_MISSING_CHILD_FIELD`: the child node exists but its
+      template has no ``proxy.field`` key.
+    - :data:`GROUP_PROXY_DUPLICATE_CHILD_ID`: two direct child nodes share the
+      same id. Reported once per duplicated id, independently of proxies;
+      proxies at such an id resolve against the first occurrence, mirroring
+      :func:`update_template`.
+
+    Template fields without a ``proxy`` are skipped.
+    """
+    issues: list[GroupProxyReferenceIssue] = []
+    if isinstance(flow_object, dict) and isinstance(flow_object.get("nodes"), list):
+        _collect_group_proxy_issues(flow_object["nodes"], issues)
+    return issues
+
+
+def _collect_group_proxy_issues(nodes: list, issues: list[GroupProxyReferenceIssue]) -> None:
+    """Recursively check each group node among ``nodes``, layer by layer."""
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        node_data = node.get("data")
+        node_info = node_data.get("node") if isinstance(node_data, dict) else None
+        if not isinstance(node_info, dict):
+            continue
+        group_flow = node_info.get("flow")
+        group_data = group_flow.get("data") if isinstance(group_flow, dict) else None
+        if not isinstance(group_data, dict):
+            continue  # Regular node; only group nodes carry a nested flow.
+        child_nodes = group_data.get("nodes")
+        child_nodes = child_nodes if isinstance(child_nodes, list) else []
+        _check_single_group(node.get("id"), node_info.get("template"), child_nodes, issues)
+        # Nested groups are children of this one; descend into the next layer.
+        _collect_group_proxy_issues(child_nodes, issues)
+
+
+def _check_single_group(
+    group_id: Any,
+    template: Any,
+    child_nodes: list,
+    issues: list[GroupProxyReferenceIssue],
+) -> None:
+    """Check one group node: duplicate child ids first, then its proxy fields."""
+    group_key = group_id if isinstance(group_id, str) else None
+    children_by_id: dict[str, dict] = {}
+    duplicate_ids: set[str] = set()
+    for child in child_nodes:
+        if not isinstance(child, dict) or not isinstance(child.get("id"), str):
+            continue
+        child_id = child["id"]
+        if child_id in children_by_id:
+            duplicate_ids.add(child_id)
+        else:
+            children_by_id[child_id] = child
+
+    found: list[GroupProxyReferenceIssue] = [
+        GroupProxyReferenceIssue(
+            group_id=group_key,
+            field_name=None,
+            category=GROUP_PROXY_DUPLICATE_CHILD_ID,
+            proxy_id=child_id,
+        )
+        for child_id in sorted(duplicate_ids)
+    ]
+
+    if isinstance(template, dict):
+        for field_name, field in template.items():
+            if not isinstance(field, dict) or "proxy" not in field:
+                continue  # Input without a proxy: nothing to resolve.
+            # An explicit null mirrors a missing proxy at runtime (update_template).
+            proxy = field.get("proxy")
+            if proxy is None:
+                continue
+            proxy_id = proxy.get("id") if isinstance(proxy, dict) else None
+            proxy_field = proxy.get("field") if isinstance(proxy, dict) else None
+
+            if isinstance(proxy, dict) and isinstance(proxy_id, str) and isinstance(proxy_field, str):
+                child = children_by_id.get(proxy_id)
+                if child is None:
+                    category = GROUP_PROXY_MISSING_CHILD_NODE
+                elif not _child_template_has_field(child, proxy_field):
+                    category = GROUP_PROXY_MISSING_CHILD_FIELD
+                else:
+                    continue
+            else:
+                category = GROUP_PROXY_MALFORMED
+                proxy_id = proxy_id if isinstance(proxy_id, str) else None
+                proxy_field = proxy_field if isinstance(proxy_field, str) else None
+
+            found.append(
+                GroupProxyReferenceIssue(
+                    group_id=group_key,
+                    field_name=field_name if isinstance(field_name, str) else None,
+                    category=category,
+                    proxy_id=proxy_id,
+                    proxy_field=proxy_field,
+                )
+            )
+
+    issues.extend(found)
+
+
+def _child_template_has_field(child_node: dict, field_name: str) -> bool:
+    """Return whether a direct child node's input template defines ``field_name``."""
+    child_data = child_node.get("data")
+    child_info = child_data.get("node") if isinstance(child_data, dict) else None
+    child_template = child_info.get("template") if isinstance(child_info, dict) else None
+    return isinstance(child_template, dict) and field_name in child_template
 
 
 def update_target_handle(new_edge, g_nodes):
