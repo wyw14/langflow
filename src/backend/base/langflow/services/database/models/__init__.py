@@ -40,6 +40,11 @@ from .knowledge_base_storage_migration import KnowledgeBaseStorageMigration
 from .mcp_server import MCPServer
 from .memory_base import MemoryBase, MemoryBaseSession, MemoryBaseWorkflowRun, MessageIngestionRecord
 from .message import MessageTable
+from .message_attachment import (
+    MessageAttachment,
+    MessageAttachmentCreate,
+    MessageAttachmentRead,
+)
 from .model_provider_policy import ModelProviderPolicy
 from .policy_bundle import PolicyBundleActive, PolicyBundleRevision
 from .project_replacement_operation import ProjectReplacementOperation
@@ -100,6 +105,9 @@ __all__ = [
     "MemoryBase",
     "MemoryBaseSession",
     "MemoryBaseWorkflowRun",
+    "MessageAttachment",
+    "MessageAttachmentCreate",
+    "MessageAttachmentRead",
     "MessageIngestionRecord",
     "MessageTable",
     "ModelProviderPolicy",

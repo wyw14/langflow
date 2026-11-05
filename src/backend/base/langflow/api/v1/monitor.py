@@ -28,6 +28,21 @@ from langflow.services.database.models.message.model import (
     MessageTable,
     MessageUpdate,
 )
+from langflow.services.database.models.message_attachment import (
+    MessageAttachment,
+    MessageAttachmentCreate,
+    MessageAttachmentRead,
+)
+from langflow.services.database.models.message_attachment.crud import (
+    bump_message_attachment_versions,
+    create_message_attachment,
+    get_message_attachment_for_user,
+    get_session_tenant_ids,
+    get_stamped_session_tenant_ids,
+    list_message_attachments_for_user_session,
+    session_has_owned_attachments,
+    soft_delete_message_attachment,
+)
 from langflow.services.database.models.transactions.crud import transform_transaction_table_for_logs
 from langflow.services.database.models.transactions.model import TransactionLogsResponse, TransactionTable
 from langflow.services.database.models.user.model import User
@@ -448,13 +463,18 @@ async def update_message(
 
     try:
         previous_positive_feedback = _get_positive_feedback_value(db_message)
+        previous_files = list(db_message.files or [])
         message_dict = message.model_dump(exclude_unset=True, exclude_none=True)
         if "text" in message_dict and message_dict["text"] != db_message.text:
             # Keep edit flag consistent for UI/audit consumers when content changes.
             message_dict["edit"] = True
+        # A new message version replaces its text and/or the attachment set.
+        attachments_changed = "files" in message_dict and message_dict["files"] != previous_files
         db_message.sqlmodel_update(message_dict)
         session.add(db_message)
         await session.flush()
+        if message_dict.get("edit") is True or attachments_changed:
+            await bump_message_attachment_versions(session, db_message.id)
         await session.refresh(db_message)
     except StaleDataError as e:
         # A flow/session cleanup can delete the row after the ownership lookup.
@@ -659,6 +679,231 @@ def _compute_shared_message_flow_id(user_id: UUID, source_flow_id: UUID) -> UUID
     return compute_virtual_flow_id(user_id, source_flow_id, principal_type="user")
 
 
+# ---------------------------------------------------------------------------
+# Chat attachment reference manifest
+# ---------------------------------------------------------------------------
+
+# Bounds mirror the message-history endpoints: an unbounded session scan would
+# serialize every reference on each poll and freeze long-running sessions.
+_ATTACHMENTS_DEFAULT_LIMIT = 100
+_ATTACHMENTS_MAX_LIMIT = 500
+
+
+async def _find_owned_session_message(
+    session: DbSession,
+    user_id: UUID,
+    session_id: str,
+) -> MessageTable | None:
+    """Return the newest message in a session owned by the caller.
+
+    Checks persisted flows (ownership through the Flow join) and the per-user
+    virtual flow ids used by shared/public-flow runs (no Flow row to join, so
+    ownership comes from the stamped ``MessageTable.user_id``).
+    """
+    stmt = (
+        select(MessageTable)
+        .join(Flow, MessageTable.flow_id == Flow.id)
+        .where(Flow.user_id == user_id, persisted_flow_history_filter())
+        .where(MessageTable.session_id == session_id)
+        .order_by(col(MessageTable.timestamp).desc(), col(MessageTable.id).desc())
+        .limit(1)
+    )
+    message = (await session.exec(stmt)).first()
+    if message is not None:
+        return message
+    stmt = (
+        select(MessageTable)
+        .where(MessageTable.session_id == session_id, col(MessageTable.user_id) == user_id)
+        .order_by(col(MessageTable.timestamp).desc(), col(MessageTable.id).desc())
+        .limit(1)
+    )
+    return (await session.exec(stmt)).first()
+
+
+async def _resolve_session_tenant(
+    session: DbSession,
+    *,
+    user_id: UUID,
+    session_id: str,
+    requested_tenant: str | None,
+) -> str | None:
+    """Enforce tenant scope on a session and return the resolved tenant stamp.
+
+    Tenant claims live on ``MessageTable.session_metadata['tenant_id']``; once
+    messages are purged, the tenant stamped on the reference rows remains
+    authoritative. A claimed tenant session without a matching caller context
+    is refused (403) so one tenant cannot read another's attachment manifest.
+    Legacy sessions with no tenant claim stay owner-scoped (tenant returned as
+    None) for backward compatibility.
+    """
+    tenants = await get_session_tenant_ids(session, session_id, user_id=user_id)
+    tenants |= await get_stamped_session_tenant_ids(session, user_id=user_id, session_id=session_id)
+    if tenants:
+        if not requested_tenant:
+            raise HTTPException(
+                status_code=403,
+                detail="Tenant context is required to access this session's attachments.",
+            )
+        if requested_tenant not in tenants:
+            raise HTTPException(status_code=403, detail="Tenant mismatch: attachment access denied.")
+        return requested_tenant
+    return None
+
+
+def _attachment_read(attachment: MessageAttachment) -> MessageAttachmentRead:
+    return MessageAttachmentRead.model_validate(attachment, from_attributes=True)
+
+
+@router.post(
+    "/messages/session/{session_id}/attachments",
+    status_code=201,
+    dependencies=[Depends(get_current_active_user)],
+)
+async def register_session_attachment(
+    session_id: str,
+    payload: MessageAttachmentCreate,
+    session: DbSession,
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    tenant_id: Annotated[str | None, Query(description="Caller tenant context")] = None,
+) -> MessageAttachmentRead:
+    """Register one attachment reference (id/size/MIME/message version) for a session.
+
+    The reference carries no file body and no storage path. Ownership and
+    tenant scope are resolved server-side from the session the caller already
+    owns; a caller cannot register under another user's or tenant's scope.
+    """
+    from urllib.parse import unquote
+
+    session_id = unquote(session_id)
+    try:
+        owned_message = await _find_owned_session_message(session, current_user.id, session_id)
+        if owned_message is not None:
+            flow_id = owned_message.flow_id
+        elif payload.flow_id is not None and not is_virtual_flow_id(payload.flow_id):
+            # Session-start edge: the first message is not persisted yet, but
+            # the caller owns (or holds a grant on) the flow the session runs on.
+            flow = await _ensure_flow_action_or_404(
+                session, flow_id=payload.flow_id, user=current_user, action=FlowAction.READ
+            )
+            if flow is None:
+                raise HTTPException(status_code=404, detail="Session not found")
+            flow_id = flow.id
+        else:
+            # Same response for "session does not exist" and "session is foreign".
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        resolved_tenant = await _resolve_session_tenant(
+            session,
+            user_id=current_user.id,
+            session_id=session_id,
+            requested_tenant=tenant_id,
+        )
+
+        if payload.id is not None:
+            existing = await get_message_attachment_for_user(session, current_user.id, payload.id)
+            if existing is not None:
+                raise HTTPException(status_code=409, detail="Attachment reference already registered")
+
+        attachment = await create_message_attachment(
+            session,
+            data=payload,
+            session_id=session_id,
+            user_id=current_user.id,
+            flow_id=flow_id,
+            tenant_id=resolved_tenant,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return _attachment_read(attachment)
+
+
+@router.get(
+    "/messages/session/{session_id}/attachments",
+    dependencies=[Depends(get_current_active_user)],
+)
+async def list_session_attachments(
+    session_id: str,
+    session: DbSession,
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    tenant_id: Annotated[str | None, Query(description="Caller tenant context")] = None,
+    limit: Annotated[int | None, Query(ge=0)] = None,
+    offset: Annotated[int | None, Query(ge=0)] = None,
+) -> list[MessageAttachmentRead]:
+    """Return a session's attachment reference manifest for the authenticated user.
+
+    Returns attachment ID, size, MIME type and the associated message version
+    only — never file content or a storage path. References whose attachment
+    was deleted are retained as inaccessible tombstone markers.
+    """
+    from urllib.parse import unquote
+
+    session_id = unquote(session_id)
+    try:
+        owned_message = await _find_owned_session_message(session, current_user.id, session_id)
+        if owned_message is None and not await session_has_owned_attachments(
+            session, user_id=current_user.id, session_id=session_id
+        ):
+            raise HTTPException(status_code=404, detail="Session not found")
+        resolved_tenant = await _resolve_session_tenant(
+            session,
+            user_id=current_user.id,
+            session_id=session_id,
+            requested_tenant=tenant_id,
+        )
+        effective_limit = _ATTACHMENTS_DEFAULT_LIMIT if not limit else min(limit, _ATTACHMENTS_MAX_LIMIT)
+        attachments = await list_message_attachments_for_user_session(
+            session,
+            user_id=current_user.id,
+            session_id=session_id,
+            tenant_id=resolved_tenant,
+            limit=effective_limit,
+            offset=offset or 0,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return [_attachment_read(attachment) for attachment in attachments]
+
+
+@router.delete(
+    "/messages/attachments/{attachment_id}",
+    dependencies=[Depends(get_current_active_user)],
+)
+async def delete_session_attachment(
+    attachment_id: UUID,
+    session: DbSession,
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    tenant_id: Annotated[str | None, Query(description="Caller tenant context")] = None,
+) -> MessageAttachmentRead:
+    """Delete an attachment while retaining its reference as an inaccessible marker.
+
+    This is a soft delete (tombstone): the row, its ID/size/MIME and the
+    associated message version stay in the session manifest, but ``accessible``
+    flips to false. Idempotent — deleting an already tombstoned reference
+    returns the same marker.
+    """
+    try:
+        attachment = await get_message_attachment_for_user(session, current_user.id, attachment_id)
+        if attachment is None:
+            # Foreign and missing IDs are indistinguishable to avoid existence leaks.
+            raise HTTPException(status_code=404, detail="Attachment not found")
+        if attachment.tenant_id is not None and tenant_id != attachment.tenant_id:
+            # Missing context and a mismatching tenant both deny access.
+            raise HTTPException(status_code=403, detail="Tenant mismatch: attachment access denied.")
+        await soft_delete_message_attachment(attachment)
+        session.add(attachment)
+        await session.flush()
+        await session.refresh(attachment)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return _attachment_read(attachment)
+
+
 @router.get("/messages/shared/sessions")
 async def get_shared_message_sessions(
     session: DbSession,
@@ -778,12 +1023,16 @@ async def update_shared_message(
     _validate_message_attachment_scopes(message.files, (current_user.id, virtual_flow_id, source_flow_id))
 
     try:
+        previous_files = list(db_message.files or [])
         message_dict = message.model_dump(exclude_unset=True, exclude_none=True)
         if "text" in message_dict and message_dict["text"] != db_message.text:
             message_dict["edit"] = True
+        attachments_changed = "files" in message_dict and message_dict["files"] != previous_files
         db_message.sqlmodel_update(message_dict)
         session.add(db_message)
         await session.flush()
+        if message_dict.get("edit") is True or attachments_changed:
+            await bump_message_attachment_versions(session, db_message.id)
         await session.refresh(db_message)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
