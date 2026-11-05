@@ -139,6 +139,13 @@ class JobQueueService(Service):
     # Backend label used on OpenTelemetry metrics. Subclasses override.
     _backend_label: str = "memory"
 
+    # Stable status labels returned by job_diagnostic_snapshot(). These are a
+    # public string contract for ops/monitoring callers — rename with care.
+    JOB_STATUS_NOT_STARTED = "not_started"
+    JOB_STATUS_RUNNING = "running"
+    JOB_STATUS_COMPLETED = "completed"
+    JOB_STATUS_CANCELLED = "cancelled"
+
     def __init__(self) -> None:
         """Initialize the JobQueueService.
 
@@ -262,6 +269,67 @@ class JobQueueService(Service):
         return {
             "backend": "memory",
             "active_jobs": len(self._queues),
+        }
+
+    def job_diagnostic_snapshot(self, job_id: str) -> dict[str, Any]:
+        """Return a read-only single-job diagnostic snapshot (in-memory backend only).
+
+        Exposes just enough coarse state to triage a stuck build without leaking
+        job internals:
+
+        * ``status`` — lifecycle state of the job's asyncio task:
+
+          - ``not_started``: queue created but no task was ever launched.
+          - ``running``: task exists and has not finished.
+          - ``completed``: task finished, either successfully or with an error.
+          - ``cancelled``: task was cancelled.
+
+        * ``pending_events`` — number of items currently waiting in THIS
+          process's local asyncio queue (including the terminal sentinel). This
+          is strictly a process-local buffer count: the in-memory backend has no
+          shared store, so it must never be presented as a global queue length.
+
+        Safety/privacy guarantees:
+          * Never includes event payloads, job owner / user identity, or task
+            exception text — a crashed task is simply reported as ``completed``.
+          * Pure observation: does not get/drain the queue, cancel the task,
+            set cleanup timestamps, or mutate the state behind
+            :meth:`metrics_snapshot`. Repeated calls return identical data.
+
+        Args:
+            job_id: Unique identifier for the job.
+
+        Returns:
+            A fresh dict with ``backend``, ``job_id``, ``status`` and
+            ``pending_events`` keys.
+
+        Raises:
+            JobQueueNotFoundError: If no queue is registered for *job_id* —
+                including unknown IDs and jobs that have been cleaned up. The
+                exception intentionally carries no event or error content.
+        """
+        entry = self._queues.get(job_id)
+        if entry is None:
+            raise JobQueueNotFoundError(job_id)
+        main_queue, _, task, _ = entry
+
+        if task is None:
+            status = self.JOB_STATUS_NOT_STARTED
+        elif not task.done():
+            status = self.JOB_STATUS_RUNNING
+        elif task.cancelled():
+            status = self.JOB_STATUS_CANCELLED
+        else:
+            # Finished but not cancelled — success or failure alike. Do NOT call
+            # task.exception() here: diagnostics must never surface error bodies.
+            status = self.JOB_STATUS_COMPLETED
+
+        # qsize() is a non-destructive read of the local buffer; no get().
+        return {
+            "backend": self._backend_label,
+            "job_id": job_id,
+            "status": status,
+            "pending_events": main_queue.qsize(),
         }
 
     def create_queue(self, job_id: str) -> tuple[asyncio.Queue, EventManager]:
@@ -1668,6 +1736,25 @@ class RedisJobQueueService(JobQueueService):
         )
         base["cancel_stats"] = dict(self._cancel_stats)
         return base
+
+    def job_diagnostic_snapshot(self, job_id: str) -> dict[str, Any]:  # type: ignore[override]
+        """Single-job diagnostics are intentionally not implemented for Redis.
+
+        The producer's local queue is drained by the bridge as soon as events
+        arrive, while each consumer worker holds its own
+        :class:`RedisQueueWrapper` buffer — so no local ``qsize()`` represents
+        the job's queue. Reporting one would masquerade a per-process buffer
+        count as the global Redis Stream length (and would miss jobs owned by
+        other workers entirely). A Redis implementation must derive both the
+        backlog (e.g. ``XLEN``) and task ownership from Redis itself; until that
+        exists, fail loudly instead of returning misleading local state.
+        """
+        msg = (
+            "job_diagnostic_snapshot is only supported by the in-memory backend; "
+            "a local buffer count is not the Redis stream length "
+            f"(job_id: {job_id})"
+        )
+        raise NotImplementedError(msg)
 
     def get_queue_data(self, job_id: str) -> tuple[asyncio.Queue, EventManager, asyncio.Task | None, float | None]:  # type: ignore[override]
         """Return queue data for a job, always backed by a Redis Stream consumer.
